@@ -1,5 +1,5 @@
 [app]
-title = پارکینگ من
+title = Parking
 package.name = parkingman
 package.domain = org.parking
 source.dir = .
