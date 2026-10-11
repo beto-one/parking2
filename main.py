@@ -1,4 +1,5 @@
 import json
+import ssl
 import threading
 import time
 import urllib.error
@@ -30,6 +31,7 @@ PAY_LINK = "https://daramet.com/Parking?webintent&donate=50000"
 BT_NAMES = ("HC-05", "HC-06", "HC", "JDY", "BT0", "HM-10", "Arduino")
 FONT = "Persian.ttf"
 DOOR_OPEN_SEC = 5
+CAR_CM = 60          # distance below this = a car is in front of the door
 # ------------------------------------------
 
 BG = (0.06, 0.08, 0.12, 1)
@@ -40,6 +42,7 @@ RED = [0.86, 0.30, 0.30, 1]
 AMBER = [0.98, 0.78, 0.20, 1]
 PURPLE = [0.55, 0.42, 0.95, 1]
 SLATE = [0.30, 0.36, 0.46, 1]
+TEAL = [0.15, 0.50, 0.58, 1]
 DISABLED = [0.17, 0.20, 0.26, 1]
 WHITE = [1, 1, 1, 1]
 DARK = [0.10, 0.10, 0.10, 1]
@@ -47,6 +50,15 @@ MUTED = [0.62, 0.68, 0.76, 1]
 
 Window.clearcolor = BG
 Window.softinput_mode = "below_target"
+
+
+def ssl_context():
+    """Android has no system CA bundle for Python, so use certifi's."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return None
 
 
 def fa(text):
@@ -104,24 +116,65 @@ def make_label(text, size, color=WHITE, height=None):
 
 
 class Bluetooth:
-    """Sends one character to the HC-05 module over classic Bluetooth (Android)."""
+    """HC-05 over classic Bluetooth (Android).
+    Sends: 0/1 = door close/open, 2/3 = LED on/off.
+    Receives lines like "D:123" (ultrasonic distance in cm)."""
 
     def __init__(self):
         self.out = None
+        self.inp = None
+        self.on_line = None
+        self.lock = threading.Lock()
 
     def connect(self):
-        from jnius import autoclass
-        adapter = autoclass("android.bluetooth.BluetoothAdapter").getDefaultAdapter()
-        uuid = autoclass("java.util.UUID").fromString("00001101-0000-1000-8000-00805F9B34FB")
-        for dev in adapter.getBondedDevices().toArray():
-            name = dev.getName() or ""
-            if any(k.lower() in name.lower() for k in BT_NAMES):
-                sock = dev.createRfcommSocketToServiceRecord(uuid)
-                adapter.cancelDiscovery()
-                sock.connect()
-                self.out = sock.getOutputStream()
+        with self.lock:
+            if self.out is not None:
                 return True
-        return False
+            from jnius import autoclass
+            adapter = autoclass("android.bluetooth.BluetoothAdapter").getDefaultAdapter()
+            uuid = autoclass("java.util.UUID").fromString("00001101-0000-1000-8000-00805F9B34FB")
+            for dev in adapter.getBondedDevices().toArray():
+                name = dev.getName() or ""
+                if any(k.lower() in name.lower() for k in BT_NAMES):
+                    sock = dev.createRfcommSocketToServiceRecord(uuid)
+                    adapter.cancelDiscovery()
+                    sock.connect()
+                    self.inp = sock.getInputStream()
+                    self.out = sock.getOutputStream()
+                    threading.Thread(target=self._reader, args=(self.inp,), daemon=True).start()
+                    return True
+            return False
+
+    def try_connect(self):
+        if self.out is not None or self.lock.locked():
+            return
+        try:
+            self.connect()
+        except Exception:
+            pass
+
+    def _reader(self, inp):
+        buf = ""
+        while self.inp is inp:
+            try:
+                if inp.available() > 0:
+                    b = inp.read()
+                    if b < 0:
+                        break
+                    ch = chr(b)
+                    if ch == "\n":
+                        line, buf = buf.strip(), ""
+                        if line and self.on_line:
+                            self.on_line(line)
+                    else:
+                        buf += ch
+                else:
+                    time.sleep(0.1)
+            except Exception:
+                break
+        if self.inp is inp:
+            self.inp = None
+            self.out = None
 
     def send(self, ch):
         try:
@@ -132,6 +185,7 @@ class Bluetooth:
             return True
         except Exception:
             self.out = None
+            self.inp = None
             return False
 
 
@@ -147,6 +201,11 @@ class ParkingApp(App):
                 "android.permission.ACCESS_FINE_LOCATION",
             ])
         self.bt = Bluetooth()
+        self.bt.on_line = lambda line: Clock.schedule_once(lambda dt: self.on_bt_line(line))
+        self.distance = None
+        self.dist_time = 0.0
+        self.last_post = 0.0
+        self.led = False
         self.store = JsonStore(join(self.user_data_dir, "parking.json"))
         self.server = self.store.get("cfg")["server"] if self.store.exists("cfg") else DEFAULT_SERVER
         self.sel = None
@@ -184,6 +243,8 @@ class ParkingApp(App):
         card.add_widget(self.status)
         card.add_widget(self.timer)
         body.add_widget(card)
+        self.dist = make_label("", 15, MUTED, 26)
+        body.add_widget(self.dist)
 
         body.add_widget(make_label(fa("جای پارک را انتخاب کن"), 17, MUTED, 28))
 
@@ -200,12 +261,14 @@ class ParkingApp(App):
         self.paid_btn = self.mk(body, "پرداخت کردم", self.on_paid, GREEN)
         self.door_btn = self.mk(body, "باز کردن درب", self.on_door, PURPLE)
         self.ext_btn = self.mk(body, "تمدید یک ساعت", self.on_extend, SLATE)
+        self.led_btn = self.mk(body, "روشن کردن چراغ", self.on_led, TEAL)
 
         scroll.add_widget(body)
         root.add_widget(scroll)
 
         Clock.schedule_interval(lambda dt: self.refresh(), 5)
         Clock.schedule_interval(lambda dt: self.tick(), 1)
+        Clock.schedule_interval(lambda dt: self.bt_keepalive(), 10)
         self.refresh()
         self.update_ui()
         return root
@@ -289,15 +352,15 @@ class ParkingApp(App):
                 body = json.dumps(data).encode() if data is not None else None
                 req = urllib.request.Request(
                     server + path, data=body, headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=10) as r:
+                with urllib.request.urlopen(req, timeout=10, context=ssl_context()) as r:
                     res = json.loads(r.read())
             except urllib.error.HTTPError as e:
                 try:
                     res = json.loads(e.read())
                 except Exception:
                     res = {"ok": False}
-            except Exception:
-                res = {"ok": False, "reason": "net"}
+            except Exception as e:
+                res = {"ok": False, "reason": "net", "err": f"{type(e).__name__}: {e}"}
             if cb:
                 Clock.schedule_once(lambda dt: cb(res))
         threading.Thread(target=work, daemon=True).start()
@@ -313,7 +376,7 @@ class ParkingApp(App):
             self.update_ui()
         elif res.get("reason") == "net" and self.net_ok:
             self.net_ok = False
-            self.say_flash("ارتباط با سرور برقرار نیست", "اینترنت یا آدرس سرور را چک کن")
+            self.say_flash("ارتباط با سرور برقرار نیست", "اینترنت یا آدرس سرور را چک کن", res.get("err", "")[:80])
 
     def choose(self, n):
         if self.state == "select":
@@ -347,7 +410,7 @@ class ParkingApp(App):
             self.pending = None
             self.say_flash("این جا همین الان پر شد", "جای دیگری انتخاب کن")
         else:
-            self.say_flash("خطا در ارتباط با سرور")
+            self.say_flash("خطا در ارتباط با سرور", res.get("err", "")[:80])
         self.update_ui()
 
     def after_extend(self, res):
@@ -357,7 +420,7 @@ class ParkingApp(App):
                 self.state = "parked"
             self.save()
         else:
-            self.say_flash("خطا در ارتباط با سرور")
+            self.say_flash("خطا در ارتباط با سرور", res.get("err", "")[:80])
         self.update_ui()
 
     def on_door(self):
@@ -381,6 +444,38 @@ class ParkingApp(App):
             self.api("/release", {"spot": self.spot})
             self.spot, self.sel, self.state = None, None, "select"
         self.save()
+        self.update_ui()
+
+    def on_led(self):
+        want = not self.led
+
+        def work():
+            ok = self.bt.send("2" if want else "3")
+            Clock.schedule_once(lambda dt: self.after_led(ok, want))
+        threading.Thread(target=work, daemon=True).start()
+
+    def after_led(self, ok, want):
+        if not ok:
+            return self.say_flash("اتصال بلوتوث برقرار نشد", "ماژول را در تنظیمات گوشی جفت کن")
+        self.led = want
+        self.update_ui()
+
+    def bt_keepalive(self):
+        """Keep the Bluetooth link up so distance readings keep arriving."""
+        if platform == "android" and self.bt.out is None:
+            threading.Thread(target=self.bt.try_connect, daemon=True).start()
+
+    def on_bt_line(self, line):
+        if not line.startswith("D:"):
+            return
+        try:
+            self.distance = int(line[2:])
+        except ValueError:
+            return
+        self.dist_time = time.time()
+        if self.server and self.dist_time - self.last_post >= 5:
+            self.last_post = self.dist_time
+            self.api("/sensor", {"distance": self.distance})
         self.update_ui()
 
     def tick(self):
@@ -429,6 +524,14 @@ class ParkingApp(App):
         else:
             text = lines("زمان تمام شد", "درب را باز کن و خارج شو یا تمدید کن")
         self.status.text = text
+        self.led_btn.text = fa("خاموش کردن چراغ" if self.led else "روشن کردن چراغ")
+        if self.distance is not None and time.time() - self.dist_time < 10:
+            if 0 < self.distance < CAR_CM:
+                self.dist.text = fa(f"فاصله: {self.distance} cm | ماشین جلوی درب است")
+            else:
+                self.dist.text = fa("جلوی درب خالی است")
+        else:
+            self.dist.text = ""
         self.timer.text = timer
 
 
