@@ -54,3 +54,4 @@ jobs:
           name: parking-apk
           path: bin/*.apk
           if-no-files-found: error
+
